@@ -8,6 +8,12 @@ import http.client
 from urllib.parse import urlparse
 from glob import glob
 
+# Optional local disassembly using Capstone for nicer fallbacks
+try:
+    import capstone as _capstone
+except Exception:
+    _capstone = None
+
 from mcp.server.fastmcp import FastMCP
 
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
@@ -35,25 +41,227 @@ def make_jsonrpc_request(method: str, *params):
         })
         response = conn.getresponse()
         data = json.loads(response.read().decode())
-
+        # Normalize error handling and provide richer exception types for callers
         if "error" in data:
             error = data["error"]
-            code = error["code"]
-            message = error["message"]
+            code = error.get("code")
+            message = error.get("message", "<no message>")
+            detail = error.get("data")
             pretty = f"JSON-RPC error {code}: {message}"
-            if "data" in error:
-                pretty += "\n" + error["data"]
-            raise Exception(pretty)
+            if detail:
+                pretty += "\n" + str(detail)
+            # Detect some plugin-side internal errors and raise a typed exception
+            # Note: func.name AttributeError has been fixed in the plugin file
+            if isinstance(detail, str) and "func_t' object has no attribute 'name'" in detail:
+                raise PluginInternalError("disassemble_function_bug", pretty)
+            # Generic remote error
+            raise RemoteJSONRPCError(code, message, detail)
 
-        result = data["result"]
+        result = data.get("result")
         # NOTE: LLMs do not respond well to empty responses
         if result is None:
             result = "success"
         return result
     except Exception:
+        # Re-raise so callers can catch typed exceptions introduced above
         raise
     finally:
         conn.close()
+
+
+class RemoteJSONRPCError(Exception):
+    """Generic JSON-RPC error returned by the IDA plugin."""
+    def __init__(self, code, message, data=None):
+        super().__init__(f"JSON-RPC error {code}: {message}")
+        self.code = code
+        self.message = message
+        self.data = data
+
+
+class PluginInternalError(Exception):
+    """Specific marker for plugin internal errors that need special handling."""
+    def __init__(self, kind: str, message: str = ""):
+        super().__init__(message)
+        self.kind = kind
+
+
+def disassemble_with_fallback(ea: str):
+    """Try to disassemble using the plugin; on known plugin bug, fall back to a bytes-based disassembly.
+
+    Returns plugin result or a dict {"fallback": True, "asm": "..."} when fallback used.
+    """
+    try:
+        return make_jsonrpc_request("disassemble_function", ea)
+    except PluginInternalError as pie:
+        # Known disassemble plugin bug. Try to gather function bounds and raw bytes and return them.
+        try:
+            func = make_jsonrpc_request("get_function_by_address", ea)
+            # func is expected to contain 'address' and 'size'
+            size = func.get("size")
+            # size may be hex string — try to coerce
+            if isinstance(size, str):
+                try:
+                    size_int = int(size, 0)
+                except Exception:
+                    size_int = None
+            else:
+                size_int = int(size) if size is not None else None
+
+            if not size_int:
+                raise
+
+            # The MCP plugin exposes a read_memory_bytes helper; use it when get_bytes isn't available
+            try:
+                bytes_blob = make_jsonrpc_request("read_memory_bytes", ea, size_int)
+            except Exception:
+                # fall back to the older/get_bytes name if present elsewhere
+                bytes_blob = make_jsonrpc_request("get_bytes", ea, size_int)
+
+            # If capstone is available, attempt to disassemble locally for a nicer fallback
+            asm_text = None
+            try:
+                raw = None
+                # bytes_blob might already be a hex string or list of ints
+                if isinstance(bytes_blob, str):
+                    s = bytes_blob.strip()
+                    # common format: "0x55 0x8b 0xec ..." (space-separated 0xNN)
+                    if s.startswith("0x") or " 0x" in s or ",0x" in s:
+                        parts = [p.strip().lstrip("0x") for p in s.replace(',', ' ').split() if p.strip()]
+                        # Normalize tokens to two hex digits (pad single-digit nibbles)
+                        norm = []
+                        for p in parts:
+                            tok = p.strip()
+                            if len(tok) == 0:
+                                continue
+                            # remove any stray non-hex chars
+                            tok = ''.join([c for c in tok if c in '0123456789abcdefABCDEF'])
+                            if len(tok) == 0:
+                                continue
+                            if len(tok) % 2 == 1:
+                                tok = tok.zfill(2)
+                            norm.append(tok)
+                        try:
+                            raw = bytes.fromhex(''.join(norm))
+                        except Exception:
+                            raw = None
+                    else:
+                        # maybe a plain hex string without 0x and possibly spaces
+                        compact = ''.join([c for c in s if c in '0123456789abcdefABCDEF'])
+                        try:
+                            if len(compact) % 2 == 1:
+                                compact = '0' + compact
+                            raw = bytes.fromhex(compact)
+                        except Exception:
+                            raw = None
+                elif isinstance(bytes_blob, list):
+                    raw = bytes(bytes_blob)
+                elif isinstance(bytes_blob, (bytes, bytearray)):
+                    raw = bytes(bytes_blob)
+
+                if raw is not None and _capstone is not None:
+                    # Attempt to autodetect architecture from bytes heuristics
+                    arch = _capstone.CS_ARCH_X86
+                    # Heuristic: common 32-bit prologue is 0x55 0x8b 0xec
+                    mode = _capstone.CS_MODE_64
+                    try:
+                        if len(raw) >= 3 and raw[0] == 0x55 and raw[1] == 0x8b and raw[2] == 0xec:
+                            mode = _capstone.CS_MODE_32
+                    except Exception:
+                        mode = _capstone.CS_MODE_64
+                    cs = _capstone.Cs(arch, mode)
+                    cs.detail = False
+                    lines = []
+                    for i in cs.disasm(raw, int(func.get("address", "0"), 0)):
+                        lines.append(f"0x{i.address:x}:\t{i.mnemonic}\t{i.op_str}")
+                    asm_text = "\n".join(lines)
+            except Exception:
+                asm_text = None
+
+            result = {"fallback": True, "func": func, "bytes": bytes_blob}
+            if asm_text:
+                result["asm"] = asm_text
+            return result
+        except Exception as e:
+            raise
+
+
+def rename_local_variable_with_promote(function_address: str, old_name: str, new_name: str):
+    """Attempt to rename a local variable, with fallbacks if IDA refuses a direct rename.
+
+    Strategy:
+      1. Try simple rename_local_variable.
+      2. If that fails, inspect stack frame variables. If the target is a struct/array member, attempt to set the stack frame variable type/name.
+      3. If all else fails, set a function comment recording the desired name.
+    """
+    try:
+        return make_jsonrpc_request("rename_local_variable", function_address, old_name, new_name)
+    except Exception:
+        # gather frame variables and attempt a safer edit
+        try:
+            vars_list = make_jsonrpc_request("get_stack_frame_variables", function_address)
+            # vars_list could be a dict or list of entries; try to find matching old_name
+            found = None
+            if isinstance(vars_list, dict):
+                # some endpoints return streaming dicts; normalize
+                for k, v in vars_list.items():
+                    if isinstance(v, dict) and v.get("name") == old_name:
+                        found = v
+                        break
+            elif isinstance(vars_list, list):
+                for v in vars_list:
+                    if v.get("name") == old_name:
+                        found = v
+                        break
+
+            if found:
+                # Try a non-invasive type update if API available
+                try:
+                    # Prefer set_local_variable_type if exposed
+                    return make_jsonrpc_request("set_local_variable_type", function_address, old_name, new_name)
+                except Exception:
+                    # As a last resort, write a comment on the function documenting the intended name
+                    comment = f"renamed_local:{old_name}->{new_name}"
+                    try:
+                        make_jsonrpc_request("set_comment", function_address, comment)
+                        return {"commented": True}
+                    except Exception:
+                        raise
+            else:
+                # Not found: write a general function comment
+                comment = f"desired_local_rename:{old_name}->{new_name}"
+                make_jsonrpc_request("set_comment", function_address, comment)
+                return {"commented": True}
+        except Exception:
+            raise
+
+
+def repro_disassemble_error(ea: str, outpath: str = None):
+    """Attempt to reproduce disassemble failure and collect diagnostics: function bounds, platform info, and traceback.
+
+    If outpath is provided, write a JSON dump to that file.
+    """
+    import traceback
+    diag = {"ea": ea, "sys_version": sys.version, "platform": sys.platform}
+    try:
+        make_jsonrpc_request("disassemble_function", ea)
+        diag["status"] = "success"
+    except Exception as e:
+        diag["status"] = "failed"
+        diag["error"] = str(e)
+        diag["traceback"] = traceback.format_exc()
+        try:
+            func = make_jsonrpc_request("get_function_by_address", ea)
+            diag["function"] = func
+        except Exception:
+            diag["function"] = None
+
+    if outpath:
+        try:
+            with open(outpath, "w", encoding="utf-8") as f:
+                json.dump(diag, f, indent=2)
+        except Exception:
+            pass
+    return diag
 
 @mcp.tool()
 def check_connection() -> str:
@@ -211,13 +419,12 @@ def generate_readme():
                 signature += ", "
             signature += arg.arg
         signature += ")"
-        description = visitor.descriptions.get(function.name, "<no description>").strip().split("\n")[0]
+        description = visitor.descriptions.get(function.name, "<no description>").strip()
         if description[-1] != ".":
             description += "."
         return f"- `{signature}`: {description}"
     for safe_function in SAFE_FUNCTIONS:
-        if safe_function != "check_connection":
-            print(get_description(safe_function))
+        print(get_description(safe_function))
     print("\nUnsafe functions (`--unsafe` flag required):\n")
     for unsafe_function in UNSAFE_FUNCTIONS:
         print(get_description(unsafe_function))
@@ -313,10 +520,10 @@ def print_mcp_config():
 def install_mcp_servers(*, uninstall=False, quiet=False, env={}):
     if sys.platform == "win32":
         configs = {
-            "Cline": (os.path.join(os.getenv("APPDATA", ""), "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
-            "Roo Code": (os.path.join(os.getenv("APPDATA", ""), "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
-            "Kilo Code": (os.path.join(os.getenv("APPDATA", ""), "Code", "User", "globalStorage", "kilocode.kilo-code", "settings"), "mcp_settings.json"),
-            "Claude": (os.path.join(os.getenv("APPDATA", ""), "Claude"), "claude_desktop_config.json"),
+            "Cline": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
+            "Roo Code": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
+            "Kilo Code": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "kilocode.kilo-code", "settings"), "mcp_settings.json"),
+            "Claude": (os.path.join(os.getenv("APPDATA"), "Claude"), "claude_desktop_config.json"),
             "Cursor": (os.path.join(os.path.expanduser("~"), ".cursor"), "mcp.json"),
             "Windsurf": (os.path.join(os.path.expanduser("~"), ".codeium", "windsurf"), "mcp_config.json"),
             "Claude Code": (os.path.join(os.path.expanduser("~")), ".claude.json"),
@@ -387,7 +594,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False, env={}):
         else:
             # Copy environment variables from the existing server if present
             if mcp.name in mcp_servers:
-                for key, value in mcp_servers[mcp.name].get("env", {}).items():
+                for key, value in mcp_servers[mcp.name].get("env", {}):
                     env[key] = value
             if copy_python_env(env):
                 print(f"[WARNING] Custom Python environment variables detected")
